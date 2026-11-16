@@ -1,0 +1,9 @@
+{
+  "name": "futevolei-gg",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FUTEVOLEI.GG — jogo de futevôlei 3D no navegador",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
