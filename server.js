@@ -4230,6 +4230,7 @@ var Athlete = class {
     this.speedMul = 1;
     this.isHuman = false;
     this.reachBonus = 0.18;
+    this.tired = 0;
     this.emote = null;
     this.emoteT = 0;
     this.lastLabel = null;
@@ -4424,6 +4425,7 @@ var Athlete = class {
     this.pz = this.z;
     this.py = this.y;
     if (this.cooldown > 0) this.cooldown -= dt;
+    if (this.tired > 0) this.tired = Math.max(0, this.tired - dt * 0.012);
     if (this.emote) this.emoteT += dt;
     const a = this.action;
     const netFace = this.side < 0 ? Math.PI / 2 : -Math.PI / 2;
@@ -4655,16 +4657,21 @@ var AIController = class {
     const prec = 0.45 + 0.75 * charge;
     if (intent !== "pingo") {
       let bestScore = -1;
+      const mine = this.lastTargets || (this.lastTargets = []);
       for (let k = 0; k < 14; k++) {
         const tx = -a.side * r.range(3, 8.2), tz = r.range(-3.9, 3.9);
         let dmin = 99;
         for (const o of opp) dmin = Math.min(dmin, Math.hypot(o.x - tx, o.z - tz));
-        const score = dmin * (0.4 + d.smart * 0.6) + r() * (1.6 - d.smart);
+        let rep = 0;
+        for (const p of mine) rep += Math.max(0, 1.6 - Math.abs(p - tz)) / 1.6;
+        const score = dmin * (0.4 + d.smart * 0.6) + r() * (1.6 - d.smart) - rep * (d.memory || 0) * 0.9;
         if (score > bestScore) {
           bestScore = score;
           target = { x: tx, z: tz };
         }
       }
+      mine.push(target.z);
+      if (mine.length > 4) mine.shift();
       target.x += r.gauss() * d.aimErr * 0.6 * prec;
       target.z += r.gauss() * d.aimErr * 0.6 * prec;
     } else {
@@ -4750,8 +4757,23 @@ var AIController = class {
       return;
     }
     if (this.blockDuty(match)) return;
-    const hx = a.side * 5.3;
+    let hx = a.side * 5.3;
     let hz = (a.idx ? 2.2 : -2.2) + clamp(ball.z, -4, 4) * 0.22;
+    const memW = this.diff.memory || 0;
+    const mem = match.memory ? match.memory[1 - a.team] : null;
+    if (memW > 0 && mem && mem.length >= 3) {
+      let mz = 0, sh = 0, hot = 0;
+      for (const e of mem) {
+        mz += e.z;
+        sh += e.short + e.feint;
+        hot += Math.max(e.shark, e.force > 0.5 ? 1 : 0);
+      }
+      mz /= mem.length;
+      sh /= mem.length;
+      hot /= mem.length;
+      hz += clamp(mz, -3.5, 3.5) * 0.35 * memW;
+      hx = a.side * (5.3 - clamp(sh, 0, 0.6) * 2.4 * memW + hot * 1.1 * memW);
+    }
     const atk = match.athletes.find((o) => o.team !== a.team && o.action && !o.action.done && !o.action.whiff && o.action.tgt && (o.action.intent === "chapa" || o.action.intent === "shark"));
     if (atk) {
       const at = atk.action;
@@ -4783,7 +4805,12 @@ var AIController = class {
       const mates = match.athletes.filter((p) => p.team === a.team);
       const humans = mates.some((p) => p.isHuman);
       const ai = mates.filter((p) => !p.isHuman && match.controllers[p.id] && match.controllers[p.id].blockDuty);
-      if (ai.length && this.rng() < (this.diff.block ?? 0.4) * (humans ? 0.7 : 1)) {
+      const mem = match.memory ? match.memory[opp] : [];
+      let hot = 0;
+      for (const e of mem) hot += Math.max(e.shark, e.force > 0.5 ? 1 : 0);
+      hot = mem.length >= 3 ? hot / mem.length : 0;
+      const pBlock = Math.min(0.85, (this.diff.block ?? 0.4) * (humans ? 0.7 : 1) * (1 + 2.2 * hot * (this.diff.memory || 0)));
+      if (ai.length && this.rng() < pBlock) {
         ai.sort((p, q) => Math.abs(p.x) - Math.abs(q.x));
         dd.id = ai[0].id;
       }
@@ -4801,7 +4828,7 @@ var AIController = class {
     if (atk) {
       if (this.blockReadAid !== atk.action.aid) {
         this.blockReadAid = atk.action.aid;
-        this.blockReads = this.rng() < (this.diff.read ?? 0.4);
+        this.blockReads = this.rng() < Math.min(0.95, (this.diff.read ?? 0.4) + (atk.action.intent === "shark" ? 0.25 : 0));
       }
       tz = atk.z;
       if (this.blockReads && atk.action.tgt) tz = clamp(atk.z * 0.65 + atk.action.tgt.z * 0.35, -3.8, 3.8);
@@ -4868,6 +4895,7 @@ var Match = class {
     this.events = [];
     this.time = 0;
     this.replica = !!opts.replica;
+    this.memory = [[], []];
     this.aidSeq = 0;
     this.phase = "SERVE";
     this.phaseT = 0;
@@ -4942,7 +4970,11 @@ var Match = class {
     const n = this.rules.touches;
     if ((intent === "dominar" || intent === "levantar") && n >= 3) intent = "devolver";
     const rough = this.rules.lastTeam === a.team ? ball.rough : 0;
-    const q = clamp(act.quality * (1 - 0.42 * rough), 0.05, 1);
+    let q = clamp(act.quality * (1 - 0.42 * rough), 0.05, 1);
+    if (part === "shark") {
+      q = clamp(q * (1 - 0.6 * a.tired), 0.05, 1);
+      a.tired = Math.min(1, a.tired + 0.27 + 0.15 * (act.charge || 0));
+    }
     const hard = clamp((speedIn - 11) / 9, 0, 1);
     const mate = this.mate(a);
     const aim = act.aim || {};
@@ -4995,8 +5027,8 @@ var Match = class {
     } else {
       let speed, noise, margin = 0.07;
       if (part === "shark") {
-        speed = 17.5 + 4.5 * q;
-        noise = 0.35 + (1 - q) * 3;
+        speed = 12.5 + 9 * q;
+        noise = (0.35 + (1 - q) * 3) * (1 + 0.45 * charge + 0.8 * charge * (1 - q));
         power = 1;
         if (q < 0.3) margin = -0.05;
       } else if (part === "chapa") {
@@ -5013,7 +5045,7 @@ var Match = class {
         power = 0.45;
       }
       speed *= act.powerMul * clamp(1.18 - Math.abs(from.x) / 9 * 0.7, 0.55, 1);
-      speed *= 0.93 + 0.24 * charge;
+      speed *= 0.96 + (part === "shark" ? 0.1 : 0.22) * charge;
       noise *= 0.55 + 1 * charge;
       margin -= 0.16 * charge * (1 - q);
       let tx, tz;
@@ -5034,6 +5066,11 @@ var Match = class {
     ball.launch(v, power);
     ball.rough = intent === "dominar" || intent === "levantar" ? clamp((1 - q) * 1.15 + (act.dive ? 0.25 : 0) + hard * 0.2, 0, 1) : 0;
     if (act.dive) name = MOVE_NAMES.peixinho;
+    if (n === 3 || intent === "chapa" || intent === "shark" || intent === "pingo") {
+      const mem = this.memory[a.team];
+      mem.push({ z: tgt ? tgt.z : 0, short: intent === "pingo" ? 1 : 0, feint: act.feint ? 1 : 0, force: charge, shark: part === "shark" ? 1 : 0 });
+      if (mem.length > 10) mem.shift();
+    }
     this.emit({ type: "touch", athlete: a, part, intent, name, quality: q, label: act.label, power, pos: from, n, speedIn, feint: !!act.feint, charge });
     if (fault) this.endPoint(1 - a.team, fault);
   }
@@ -5055,7 +5092,7 @@ var Match = class {
       const centered = 1 - dz / 0.46;
       const apexK = 1 - clamp(Math.abs(a.vy) / CFG.JUMP_V, 0, 1);
       const fast = clamp((speedIn - 14) / 8, 0, 1);
-      const q = clamp(centered * 0.55 + apexK * 0.4 - fast * 0.2 + r.gauss() * 0.1, 0, 1);
+      const q = clamp(centered * 0.55 + apexK * 0.4 - fast * 0.1 + (R.lastMove === "shark" ? 0.12 : 0) + r.gauss() * 0.1, 0, 1);
       const fault = R.touch(a.id, a.team, "bloqueio");
       let v, result;
       if (q > 0.74) {
@@ -5253,6 +5290,30 @@ var DIFFICULTY = {
   medio: { label: "M\xE9dio", react: 0.29, skill: 0.76, skillVar: 0.22, aimErr: 0.9, power: 0.8, shark: 0.16, pingo: 0.15, speed: 0.97, smart: 0.65, serveErr: 1, force: 0.45, feint: 0.07, quick: 0.1, read: 0.4, block: 0.2, blockErr: 0.085, dive: 0.22 },
   dificil: { label: "Dif\xEDcil", react: 0.19, skill: 0.9, skillVar: 0.12, aimErr: 0.5, power: 0.95, shark: 0.28, pingo: 0.18, speed: 1.03, smart: 0.92, serveErr: 0.7, force: 0.55, feint: 0.09, quick: 0.12, read: 0.4, block: 0.2, blockErr: 0.065, dive: 0.2 }
 };
+var STYLES = {
+  agressivo: { label: "Agressivo", mul: { shark: 1.8, pingo: 0.5, feint: 0.5, quick: 0.8, block: 0.8 }, add: { force: 0.3 } },
+  colocador: { label: "Colocador", mul: { shark: 0.7, pingo: 1.7, feint: 1.1, aimErr: 0.55 }, add: { force: -0.15 } },
+  fintador: { label: "Fintador", mul: { feint: 2.6, quick: 2.6, pingo: 1.3, shark: 0.9 }, add: { force: -0.1 } },
+  muralha: { label: "Muralha", mul: { block: 1.9, read: 1.3, dive: 1.25, shark: 0.75 }, add: { force: -0.1 } }
+};
+var MEMORY = { facil: 0, medio: 0.2, dificil: 0.45 };
+function cpuProfile(diffKey, styleKey) {
+  const base = DIFFICULTY[diffKey] || DIFFICULTY.medio, st = STYLES[styleKey];
+  const p = Object.assign({}, base, { memory: MEMORY[diffKey] ?? 0.35, style: styleKey || null, styleLabel: st ? st.label : "" });
+  if (st) {
+    for (const k in st.mul) p[k] = (p[k] ?? 0) * st.mul[k];
+    for (const k in st.add) p[k] = Math.min(0.95, Math.max(0.02, (p[k] ?? 0) + st.add[k]));
+    for (const k of ["shark", "pingo", "feint", "quick", "block", "read", "dive"]) p[k] = Math.min(0.95, p[k]);
+  }
+  return p;
+}
+function pickStyles(rng) {
+  const ks = Object.keys(STYLES);
+  const a = ks[Math.floor(rng() * ks.length)];
+  let b = a;
+  while (b === a) b = ks[Math.floor(rng() * ks.length)];
+  return [a, b];
+}
 var PARTNER = { label: "Parceiro", react: 0.2, skill: 0.9, skillVar: 0.1, aimErr: 0.7, power: 0.88, shark: 0.14, pingo: 0.12, speed: 1, smart: 0.8, serveErr: 0.8, force: 0.45, feint: 0.08, quick: 0.08, read: 0.5, block: 0.3, blockErr: 0.06, dive: 0.5 };
 
 // src/net/protocol.js
@@ -5467,9 +5528,10 @@ var Room = class {
         m.controllers[a.id] = new PlayerController(a, p.source, this.rng);
         m.controllers[a.id].setAssist("media");
       });
+      const styles = pickStyles(this.rng);
       for (let idx = hs.length; idx < 2; idx++) {
         const a = m.athletes[team * 2 + idx];
-        m.controllers[a.id] = new AIController(a, hs.length ? PARTNER : diff, this.rng);
+        m.controllers[a.id] = new AIController(a, hs.length ? PARTNER : cpuProfile(this.opts.diff, styles[idx]), this.rng);
       }
     }
     this.state = "play";
