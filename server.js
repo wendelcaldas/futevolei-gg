@@ -5857,6 +5857,7 @@ var ROOT = import_node_path.default.join(process.cwd(), "public");
 var TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".png": "image/png", ".jpg": "image/jpeg", ".glb": "model/gltf-binary", ".json": "application/json", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
 var cache = /* @__PURE__ */ new Map();
 var hub = new Hub();
+var onlineDirty = false;
 function load(file) {
   if (!cache.has(file)) {
     const raw = import_node_fs.default.readFileSync(file);
@@ -5871,8 +5872,8 @@ var server = import_node_http.default.createServer((req, res) => {
   } catch (e) {
   }
   if (url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: true, ...hub.stats() }));
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify({ ok: true, online: wss.clients.size, ...hub.stats() }));
   }
   let file = import_node_path.default.normalize(import_node_path.default.join(ROOT, url === "/" ? "index.html" : url));
   if (!file.startsWith(ROOT) || !import_node_fs.default.existsSync(file) || import_node_fs.default.statSync(file).isDirectory()) file = import_node_path.default.join(ROOT, "index.html");
@@ -5913,7 +5914,12 @@ wss.on("connection", (ws) => {
       }
     }
   });
-  ws.on("close", () => hub.closed(conn));
+  ws.on("close", () => {
+    hub.closed(conn);
+    onlineDirty = true;
+  });
+  onlineDirty = true;
+  conn.send(JSON.stringify({ t: "online", n: wss.clients.size }));
   ws.on("error", () => {
   });
 });
@@ -5924,6 +5930,12 @@ setInterval(() => {
     console.error("pump", e);
   }
 }, 8);
+setInterval(() => {
+  if (!onlineDirty) return;
+  onlineDirty = false;
+  const msg = JSON.stringify({ t: "online", n: wss.clients.size });
+  for (const ws of wss.clients) if (ws.readyState === 1 && ws.bufferedAmount < 65536) ws.send(msg);
+}, 3e3);
 setInterval(() => {
   for (const ws of wss.clients) {
     if (!ws.isAlive) {
