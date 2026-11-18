@@ -3995,6 +3995,7 @@ var Ball = class {
     this.spin = { x: 0, y: 0, z: 0 };
     this.restTimer = 0;
     this.power = 0;
+    this.rough = 0;
   }
   hold(x, y, z) {
     this.x = this.px = x;
@@ -4228,6 +4229,7 @@ var Athlete = class {
     this.cooldown = 0;
     this.speedMul = 1;
     this.isHuman = false;
+    this.reachBonus = 0.18;
     this.emote = null;
     this.emoteT = 0;
     this.lastLabel = null;
@@ -4254,7 +4256,7 @@ var Athlete = class {
     const n = Math.min(ball.remaining(), Math.round(window / CFG.DT));
     const yMax = dive ? 1.15 : I.yMax + (this.grounded ? 0 : this.y * 0.8);
     const fast = clamp((Math.hypot(ball.vx, ball.vz) - 9) / 9, 0, 1);
-    const reach = CFG.REACH - fast * 0.3 + (this.isHuman ? 0.18 : 0) + (dive ? 1.2 : 0);
+    const reach = CFG.REACH - fast * 0.3 + (this.isHuman ? this.reachBonus : 0) + (dive ? 1.2 : 0);
     let best = null;
     for (let i = 0; i <= n; i++) {
       const p = ball.future(i);
@@ -4337,7 +4339,8 @@ var Athlete = class {
       charge: opts.charge ?? 0,
       feint: false,
       tgt: null,
-      dive
+      dive,
+      slide: opts.slide ?? 6.5
     };
     this.retarget(c.z);
     this.lastLabel = label;
@@ -4438,7 +4441,7 @@ var Athlete = class {
         } else {
           const dx = a.sx - this.x, dz = a.sz - this.z;
           const d = Math.hypot(dx, dz);
-          const stepMax = (a.dive ? 10.5 : 6.5) * dt;
+          const stepMax = (a.dive ? 10.5 : a.slide ?? 6.5) * dt;
           if (d > 1e-4) {
             const k = Math.min(1, stepMax / d);
             this.x += dx * k;
@@ -4938,7 +4941,8 @@ var Match = class {
     const fault = this.rules.touch(a.id, a.team, intent);
     const n = this.rules.touches;
     if ((intent === "dominar" || intent === "levantar") && n >= 3) intent = "devolver";
-    const q = act.quality;
+    const rough = this.rules.lastTeam === a.team ? ball.rough : 0;
+    const q = clamp(act.quality * (1 - 0.42 * rough), 0.05, 1);
     const hard = clamp((speedIn - 11) / 9, 0, 1);
     const mate = this.mate(a);
     const aim = act.aim || {};
@@ -5028,6 +5032,7 @@ var Match = class {
       v = solveAttack(from, { x: -s * tx, y: CFG.BALL_R, z: tz }, speed, margin);
     }
     ball.launch(v, power);
+    ball.rough = intent === "dominar" || intent === "levantar" ? clamp((1 - q) * 1.15 + (act.dive ? 0.25 : 0) + hard * 0.2, 0, 1) : 0;
     if (act.dive) name = MOVE_NAMES.peixinho;
     this.emit({ type: "touch", athlete: a, part, intent, name, quality: q, label: act.label, power, pos: from, n, speedIn, feint: !!act.feint, charge });
     if (fault) this.endPoint(1 - a.team, fault);
@@ -5064,6 +5069,7 @@ var Match = class {
         v = { vx: ball.vx * r.range(0.45, 0.75), vy: r.range(-1.5, 2.6), vz: ball.vz * 0.4 + r.range(-3, 3) };
       }
       ball.launch(v, result === "forte" ? 0.7 : 0.3);
+      ball.rough = result === "forte" ? 0 : result === "amortece" ? 0.15 : 0.6;
       this.emit({ type: "touch", athlete: a, part: "bloqueio", intent: "bloqueio", name: MOVE_NAMES.bloqueio, quality: q, label: result === "forte" ? "BLOQUEIO!" : null, power: result === "forte" ? 0.7 : 0.3, pos: from, n: R.touches, speedIn, block: result });
       if (fault) this.endPoint(1 - a.team, fault);
       return;
@@ -5136,6 +5142,11 @@ var Match = class {
 };
 
 // src/core/PlayerController.js
+var ASSIST = {
+  alta: { label: "Alta", pull: 0.75, slide: 6.5, reach: 0.18 },
+  media: { label: "M\xE9dia", pull: 0.5, slide: 4.6, reach: 0.1 },
+  off: { label: "Desligada", pull: 0.22, slide: 2.4, reach: 0 }
+};
 var PlayerController = class {
   constructor(athlete, input, rng) {
     this.a = athlete;
@@ -5143,7 +5154,12 @@ var PlayerController = class {
     this.rng = rng;
     athlete.isHuman = true;
     this.diff = { react: 0, smart: 1 };
+    this.setAssist("alta");
     this.serve = { active: false, charging: false, power: 0, dir: 1, aimZ: 0 };
+  }
+  setAssist(k) {
+    this.assist = ASSIST[k] || ASSIST.alta;
+    this.a.reachBonus = this.assist.reach;
   }
   serveTarget(power = this.serve.power) {
     return { x: -this.a.side * (2.2 + power * 7.4), z: this.serve.aimZ };
@@ -5224,7 +5240,7 @@ var PlayerController = class {
     for (const intent of ["shark", "chapa", "pingo", "levantar", "dominar"]) {
       if (I.consume(intent)) {
         if (wouldDouble) break;
-        a.tryHit(match, intent, { window: (intent === "shark" ? 0.34 : 0.42) + (this.lag || 0), pull: 0.75, aim: { x: I.mx * -a.side, z: I.mz }, dive: !!I.sprint });
+        a.tryHit(match, intent, { window: (intent === "shark" ? 0.34 : 0.42) + (this.lag || 0), pull: this.assist.pull, slide: this.assist.slide, aim: { x: I.mx * -a.side, z: I.mz }, dive: !!I.sprint });
         break;
       }
     }
@@ -5449,6 +5465,7 @@ var Room = class {
         const a = m.athletes[team * 2 + idx];
         p.athlete = a;
         m.controllers[a.id] = new PlayerController(a, p.source, this.rng);
+        m.controllers[a.id].setAssist("media");
       });
       for (let idx = hs.length; idx < 2; idx++) {
         const a = m.athletes[team * 2 + idx];
@@ -5481,6 +5498,7 @@ var Room = class {
     p.cpu = false;
     p.source.reset();
     m.controllers[a.id] = new PlayerController(a, p.source, this.rng);
+    m.controllers[a.id].setAssist("media");
     const mate = m.mate(a);
     if (!this.players.some((q) => q !== p && q.athlete === mate && !q.cpu)) m.controllers[mate.id] = new AIController(mate, PARTNER, this.rng);
   }
