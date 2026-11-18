@@ -4137,6 +4137,7 @@ var Rules = class {
       if (this.lastMove === "shark") st.sharks++;
       if (this.lastMove === "chapa") st.chapas++;
       if (this.lastMove === "pingo") st.pingos++;
+      if (this.lastMove === "bloqueio") st.bloqueios++;
     }
     if (reason !== "ponto" && reason !== "ace") this.stats[1 - winner].erros++;
     if (winner !== this.servingTeam) {
@@ -4151,7 +4152,7 @@ var Rules = class {
   }
 };
 function mkStats() {
-  return { pontos: 0, aces: 0, sharks: 0, chapas: 0, pingos: 0, erros: 0 };
+  return { pontos: 0, aces: 0, sharks: 0, chapas: 0, pingos: 0, bloqueios: 0, erros: 0 };
 }
 
 // src/entities/Athlete.js
@@ -4166,8 +4167,10 @@ var RECOVERY = {
   chute: 0.42,
   cabecada: 0.36,
   saque: 0.55,
-  whiff: 0.3
+  whiff: 0.3,
+  peixinho: 1.05
 };
+var BLOCK_NET = 1.6;
 var CONTACT_OFFSET = {
   peito: 0.22,
   coxa: 0.34,
@@ -4178,7 +4181,8 @@ var CONTACT_OFFSET = {
   pingo: 0.45,
   chute: 0.55,
   cabecada: 0.2,
-  saque: 0.5
+  saque: 0.5,
+  peixinho: 0.55
 };
 var ATTACK_INTENTS = /* @__PURE__ */ new Set(["chapa", "shark"]);
 function aimTarget(side, aim, intent, fromZ = 0) {
@@ -4244,13 +4248,13 @@ var Athlete = class {
     this.emote = null;
   }
   // Procura na trajetoria prevista o melhor ponto de contato dentro da janela de tempo.
-  findContact(ball, intent, window, pull = 0.6) {
+  findContact(ball, intent, window, pull = 0.6, dive = false) {
     if (!ball.live || !ball.pred) return null;
     const I = INTENTS[intent];
     const n = Math.min(ball.remaining(), Math.round(window / CFG.DT));
-    const yMax = I.yMax + (this.grounded ? 0 : this.y * 0.8);
+    const yMax = dive ? 1.15 : I.yMax + (this.grounded ? 0 : this.y * 0.8);
     const fast = clamp((Math.hypot(ball.vx, ball.vz) - 9) / 9, 0, 1);
-    const reach = CFG.REACH - fast * 0.3 + (this.isHuman ? 0.18 : 0);
+    const reach = CFG.REACH - fast * 0.3 + (this.isHuman ? 0.18 : 0) + (dive ? 1.2 : 0);
     let best = null;
     for (let i = 0; i <= n; i++) {
       const p = ball.future(i);
@@ -4258,7 +4262,7 @@ var Athlete = class {
       if (p.y < I.yMin || p.y > yMax) continue;
       const t = i * CFG.DT;
       const d = Math.hypot(p.x - this.x, p.z - this.z);
-      if (d > reach + Math.min(pull, 5.5 * t)) continue;
+      if (d > reach + Math.min(pull, (dive ? 8 : 5.5) * t)) continue;
       const score = Math.abs(p.y - I.ideal) + 0.5 * Math.max(0, d - 0.6) + t * 0.4;
       if (!best || score < best.score) best = { i, t, x: p.x, y: p.y, z: p.z, d, score };
     }
@@ -4269,14 +4273,19 @@ var Athlete = class {
     if (this.action || this.cooldown > 0 || match.phase !== "RALLY") return false;
     const ball = match.ball;
     const window = opts.window ?? 0.4;
-    const c = this.findContact(ball, intent, window, opts.pull ?? 0.6);
+    let c = this.findContact(ball, intent, window, opts.pull ?? 0.6);
+    let dive = false;
+    if (!c && opts.dive && this.grounded && (intent === "dominar" || intent === "levantar")) {
+      c = this.findContact(ball, intent, Math.max(window, 0.5), 0.9, true);
+      dive = !!c;
+    }
     if (!c) {
       this.action = { aid: match.nextAid(), intent, part: "whiff", whiff: true, done: true, tick: 0, contactTick: 0, t: 0, tContact: 0, dur: RECOVERY.whiff, hop: 0 };
       match.emit({ type: "whiff", athlete: this });
       return false;
     }
     const I = INTENTS[intent];
-    const part = pickPart(intent, c.y - 0);
+    const part = dive ? "peixinho" : pickPart(intent, c.y - 0);
     let quality = opts.quality;
     let label = null;
     if (quality === void 0) {
@@ -4289,8 +4298,17 @@ var Athlete = class {
       quality = clamp(qT * qH * qD, 0.05, 1);
       label = quality > 0.84 ? "PERFEITO!" : c.t > tPerfect ? "CEDO" : c.y < I.ideal - 0.55 ? "TARDE" : quality > 0.6 ? "BOM" : "RUIM";
     }
+    if (dive) {
+      quality = clamp(quality * 0.5, 0.05, 0.6);
+      label = "PEIXINHO!";
+    }
     const off = CONTACT_OFFSET[part] ?? 0.3;
     let sx = c.x + this.side * off, sz = c.z;
+    if (dive) {
+      const dx = c.x - this.x, dz = c.z - this.z, dl = Math.hypot(dx, dz) || 1;
+      sx = c.x - dx / dl * off;
+      sz = c.z - dz / dl * off;
+    }
     if (sx * this.side < 0.3) sx = this.side * 0.3;
     const hopBase = part === "shark" ? 1.75 : part === "chapa" ? 1.85 : part === "cabecada" ? 1.95 : part === "pingo" ? 1.9 : 9;
     let hop = clamp(c.y - hopBase, 0, part === "shark" ? 1.35 : 1.15);
@@ -4318,7 +4336,8 @@ var Athlete = class {
       dur: c.t + (RECOVERY[part] ?? 0.35),
       charge: opts.charge ?? 0,
       feint: false,
-      tgt: null
+      tgt: null,
+      dive
     };
     this.retarget(c.z);
     this.lastLabel = label;
@@ -4350,6 +4369,29 @@ var Athlete = class {
     this.retarget(this.z);
     match.emit({ type: "feint", athlete: this });
     return true;
+  }
+  // bloqueio: pulo perto da rede com o peito/cabeca acima da fita
+  startBlock(match) {
+    this.vy = CFG.JUMP_V;
+    this.y = 1e-3;
+    this.action = {
+      aid: match.nextAid(),
+      intent: "bloqueio",
+      part: "bloqueio",
+      block: true,
+      blocked: false,
+      whiff: false,
+      done: true,
+      tick: 0,
+      contactTick: 26,
+      t: 0,
+      tContact: 0.44,
+      hop: 0,
+      y0: 0,
+      quality: 1,
+      dur: 0.9
+    };
+    match.emit({ type: "jump", athlete: this });
   }
   startServe(match, target, apex) {
     this.action = {
@@ -4396,7 +4438,7 @@ var Athlete = class {
         } else {
           const dx = a.sx - this.x, dz = a.sz - this.z;
           const d = Math.hypot(dx, dz);
-          const stepMax = 6.5 * dt;
+          const stepMax = (a.dive ? 10.5 : 6.5) * dt;
           if (d > 1e-4) {
             const k = Math.min(1, stepMax / d);
             this.x += dx * k;
@@ -4454,6 +4496,11 @@ var Athlete = class {
       }
     }
     if (this.input.jump && this.grounded) {
+      if (match.phase === "RALLY" && Math.abs(this.x) < BLOCK_NET) {
+        this.startBlock(match);
+        this._clamp();
+        return;
+      }
       this.vy = CFG.JUMP_V;
       this.y = 1e-3;
       match.emit({ type: "jump", athlete: this });
@@ -4630,6 +4677,24 @@ var AIController = class {
     inp.sprint = false;
     inp.jump = false;
     const act = a.action;
+    if (act && !act.done && !act.whiff && !act.feint && (act.intent === "chapa" || act.intent === "shark") && this.dodgeAid !== act.aid) {
+      const wall = match.athletes.find((o) => o.team !== a.team && Math.abs(o.x) < 1.5 && Math.abs(o.z - a.z) < 1.1 && (o.action ? o.action.block : true));
+      if (wall && act.contactTick - act.tick >= 4) {
+        this.dodgeAid = act.aid;
+        if (this.rng() < (this.diff.smart ?? 0.6) * 0.85) {
+          if (this.rng() < 0.32) {
+            a.feint(match);
+            this.feintAid = null;
+          } else {
+            const away = wall.z >= a.z ? -1 : 1;
+            const tz = clamp(a.z + away * (2.2 + this.rng() * 1.4), -3.8, 3.8);
+            const tx = act.tgt ? act.tgt.x : -a.side * 6;
+            act.aim = { target: { x: tx, z: tz } };
+            a.retarget();
+          }
+        }
+      }
+    }
     if (act && this.feintAid === act.aid && !act.done) {
       const left = act.contactTick - act.tick;
       if (left <= 8 + (this.rng() * 3 | 0)) {
@@ -4658,6 +4723,13 @@ var AIController = class {
       this.moveTo(plan.stand.x, plan.stand.z, true);
       if (!a.action && a.cooldown <= 0) {
         const c = a.findContact(ball, plan.intent, 0.2, 0.3);
+        if (!c && (plan.intent === "dominar" || plan.intent === "levantar") && ball.remaining() * CFG.DT < 0.42 && this.diveShot !== ball.shotId) {
+          this.diveShot = ball.shotId;
+          if (this.rng() < (this.diff.dive ?? 0.6) && a.findContact(ball, plan.intent, 0.5, 0.9, true)) {
+            a.tryHit(match, plan.intent, { window: 0.5, pull: 0.9, quality: plan.quality, dive: true });
+            return;
+          }
+        }
         if (c) {
           const urgent = ball.remaining() * CFG.DT < 0.2;
           const due = match.time >= plan.point.t - 0.24;
@@ -4674,6 +4746,7 @@ var AIController = class {
       this.moveTo(plan.support.x, plan.support.z, false);
       return;
     }
+    if (this.blockDuty(match)) return;
     const hx = a.side * 5.3;
     let hz = (a.idx ? 2.2 : -2.2) + clamp(ball.z, -4, 4) * 0.22;
     const atk = match.athletes.find((o) => o.team !== a.team && o.action && !o.action.done && !o.action.whiff && o.action.tgt && (o.action.intent === "chapa" || o.action.intent === "shark"));
@@ -4692,6 +4765,62 @@ var AIController = class {
     }
     this.moveTo(hx, hz, false);
   }
+  // decide (uma vez por toque adversario) quem do time sobe para bloquear; o outro cobre o fundo
+  blockDuty(match) {
+    const a = this.a, ball = match.ball, R = match.rules, opp = 1 - a.team;
+    if (!ball.live || R.lastTeam !== opp || ball.x * a.side > 0.2) return false;
+    const n = R.nextTouch(opp);
+    if (n < 2 || n > 3) return false;
+    const D = match.defense || (match.defense = [{}, {}]);
+    const dd = D[a.team];
+    const key = ball.shotId;
+    if (dd.key !== key) {
+      dd.key = key;
+      dd.id = -1;
+      const mates = match.athletes.filter((p) => p.team === a.team);
+      const humans = mates.some((p) => p.isHuman);
+      const ai = mates.filter((p) => !p.isHuman && match.controllers[p.id] && match.controllers[p.id].blockDuty);
+      if (ai.length && this.rng() < (this.diff.block ?? 0.4) * (humans ? 0.7 : 1)) {
+        ai.sort((p, q) => Math.abs(p.x) - Math.abs(q.x));
+        dd.id = ai[0].id;
+      }
+    }
+    if (dd.id < 0) return false;
+    const blocker = match.athletes[dd.id];
+    if (blocker !== a) {
+      if (!a.action) this.moveTo(a.side * 5.8, clamp(-blocker.z * 0.5, -2.6, 2.6), false);
+      return !a.isHuman;
+    }
+    const op = match.plans[opp];
+    let tz = ball.z;
+    if (op && op.active && op.point && op.n === 3) tz = op.point.z;
+    const atk = match.athletes.find((o) => o.team === opp && o.action && !o.action.done && !o.action.whiff && (o.action.intent === "chapa" || o.action.intent === "shark"));
+    if (atk) {
+      if (this.blockReadAid !== atk.action.aid) {
+        this.blockReadAid = atk.action.aid;
+        this.blockReads = this.rng() < (this.diff.read ?? 0.4);
+      }
+      tz = atk.z;
+      if (this.blockReads && atk.action.tgt) tz = clamp(atk.z * 0.65 + atk.action.tgt.z * 0.35, -3.8, 3.8);
+    }
+    if (!a.action) this.moveTo(a.side * 0.75, tz, true);
+    if (atk && !a.action && a.grounded && this.jumpAid !== atk.action.aid) {
+      const act = atk.action;
+      const travel = Math.abs(atk.x) / 15;
+      const tApex = CFG.JUMP_V / CFG.G;
+      const left = (act.contactTick - act.tick) * CFG.DT + travel;
+      this.jumpErr = this.jumpErr ?? 0;
+      if (this.jumpAidPlanned !== act.aid) {
+        this.jumpAidPlanned = act.aid;
+        this.jumpErr = this.rng.gauss() * (this.diff.blockErr ?? 0.07);
+      }
+      if (left <= tApex + this.jumpErr && Math.abs(a.x) < 1.6) {
+        this.jumpAid = act.aid;
+        a.input.jump = true;
+      }
+    }
+    return true;
+  }
   moveTo(x, z, sprint) {
     const a = this.a;
     const dx = x - a.x, dz = z - a.z;
@@ -4705,7 +4834,7 @@ var AIController = class {
 };
 
 // src/core/GameState.js
-var PART_NOISE = { pe: 0.45, coxa: 0.22, peito: 0.1, cabeca: 0.25 };
+var PART_NOISE = { pe: 0.45, coxa: 0.22, peito: 0.1, cabeca: 0.25, peixinho: 0.75 };
 var MOVE_NAMES = {
   peito: "PEITO",
   coxa: "COXA",
@@ -4720,7 +4849,9 @@ var MOVE_NAMES = {
   levantar: "LEVANTADA",
   devolver: "DEVOLU\xC7\xC3O",
   finta: "FINTA!",
-  rapida: "LEVANTADA R\xC1PIDA"
+  rapida: "LEVANTADA R\xC1PIDA",
+  bloqueio: "BLOQUEIO!",
+  peixinho: "PEIXINHO!"
 };
 var Match = class {
   constructor(opts = {}) {
@@ -4897,8 +5028,46 @@ var Match = class {
       v = solveAttack(from, { x: -s * tx, y: CFG.BALL_R, z: tz }, speed, margin);
     }
     ball.launch(v, power);
+    if (act.dive) name = MOVE_NAMES.peixinho;
     this.emit({ type: "touch", athlete: a, part, intent, name, quality: q, label: act.label, power, pos: from, n, speedIn, feint: !!act.feint, charge });
     if (fault) this.endPoint(1 - a.team, fault);
+  }
+  // bola atacada pelo adversario passando pelo corpo de quem pulou para bloquear
+  checkBlocks() {
+    const ball = this.ball, R = this.rules, r = this.rng;
+    for (const a of this.athletes) {
+      const act = a.action;
+      if (!act || !act.block || act.blocked || a.team === R.lastTeam || R.lastTeam < 0) continue;
+      if (ball.vx * a.side <= 0) continue;
+      const bx = ball.x * a.side;
+      if (bx < 0.01 || bx > 0.85) continue;
+      const dz = Math.abs(ball.z - a.z);
+      const lo = a.y + 1.3, hi = a.y + 2.25;
+      if (dz > 0.46 || ball.y < lo || ball.y > hi) continue;
+      act.blocked = true;
+      const s = a.side, from = { x: ball.x, y: ball.y, z: ball.z };
+      const speedIn = Math.hypot(ball.vx, ball.vy, ball.vz);
+      const centered = 1 - dz / 0.46;
+      const apexK = 1 - clamp(Math.abs(a.vy) / CFG.JUMP_V, 0, 1);
+      const fast = clamp((speedIn - 14) / 8, 0, 1);
+      const q = clamp(centered * 0.55 + apexK * 0.4 - fast * 0.2 + r.gauss() * 0.1, 0, 1);
+      const fault = R.touch(a.id, a.team, "bloqueio");
+      let v, result;
+      if (q > 0.74) {
+        result = "forte";
+        v = solveAttack(from, { x: -s * r.range(1.3, 5.2), y: CFG.BALL_R, z: clamp(ball.z + r.range(-2.6, 2.6), -3.8, 3.8) }, clamp(speedIn * 0.42, 6.5, 10), 0.03);
+      } else if (q > 0.55) {
+        result = "amortece";
+        v = solveApex(from, { x: s * r.range(1.6, 2.8), y: 1.2, z: clamp(a.z * 0.6 + r.range(-1, 1), -3.4, 3.4) }, Math.max(from.y + 0.9, 3.5));
+      } else {
+        result = "desvio";
+        v = { vx: ball.vx * r.range(0.45, 0.75), vy: r.range(-1.5, 2.6), vz: ball.vz * 0.4 + r.range(-3, 3) };
+      }
+      ball.launch(v, result === "forte" ? 0.7 : 0.3);
+      this.emit({ type: "touch", athlete: a, part: "bloqueio", intent: "bloqueio", name: MOVE_NAMES.bloqueio, quality: q, label: result === "forte" ? "BLOQUEIO!" : null, power: result === "forte" ? 0.7 : 0.3, pos: from, n: R.touches, speedIn, block: result });
+      if (fault) this.endPoint(1 - a.team, fault);
+      return;
+    }
   }
   endPoint(winner, reason) {
     if (this.phase !== "RALLY") return;
@@ -4946,6 +5115,7 @@ var Match = class {
     if (this.phase === "SERVE" && this.server && !this.server.action) {
       ball.hold(this.server.x - this.server.side * 0.6, 0.24, this.server.z);
     }
+    if (this.phase === "RALLY" && ball.live && !this.replica) this.checkBlocks();
     const ev = ball.step(dt);
     if (ev === "net" || ev === "tape") this.emit({ type: ev, pos: { x: ball.x, y: ball.y, z: ball.z } });
     if (ev === "ground") {
@@ -5054,7 +5224,7 @@ var PlayerController = class {
     for (const intent of ["shark", "chapa", "pingo", "levantar", "dominar"]) {
       if (I.consume(intent)) {
         if (wouldDouble) break;
-        a.tryHit(match, intent, { window: (intent === "shark" ? 0.34 : 0.42) + (this.lag || 0), pull: 0.75, aim: { x: I.mx * -a.side, z: I.mz } });
+        a.tryHit(match, intent, { window: (intent === "shark" ? 0.34 : 0.42) + (this.lag || 0), pull: 0.75, aim: { x: I.mx * -a.side, z: I.mz }, dive: !!I.sprint });
         break;
       }
     }
@@ -5063,14 +5233,14 @@ var PlayerController = class {
 
 // src/ai/Difficulty.js
 var DIFFICULTY = {
-  facil: { label: "F\xE1cil", react: 0.42, skill: 0.6, skillVar: 0.3, aimErr: 1.5, power: 0.68, shark: 0.06, pingo: 0.12, speed: 0.9, smart: 0.35, serveErr: 1.4, force: 0.3, feint: 0.03, quick: 0.04, read: 0.15 },
-  medio: { label: "M\xE9dio", react: 0.29, skill: 0.76, skillVar: 0.22, aimErr: 0.9, power: 0.8, shark: 0.16, pingo: 0.15, speed: 0.97, smart: 0.65, serveErr: 1, force: 0.45, feint: 0.09, quick: 0.1, read: 0.45 },
-  dificil: { label: "Dif\xEDcil", react: 0.19, skill: 0.9, skillVar: 0.12, aimErr: 0.5, power: 0.95, shark: 0.28, pingo: 0.18, speed: 1.03, smart: 0.92, serveErr: 0.7, force: 0.55, feint: 0.15, quick: 0.16, read: 0.7 }
+  facil: { label: "F\xE1cil", react: 0.42, skill: 0.6, skillVar: 0.3, aimErr: 1.5, power: 0.68, shark: 0.06, pingo: 0.12, speed: 0.9, smart: 0.35, serveErr: 1.4, force: 0.3, feint: 0.03, quick: 0.04, read: 0.15, block: 0.1, blockErr: 0.12, dive: 0.1 },
+  medio: { label: "M\xE9dio", react: 0.29, skill: 0.76, skillVar: 0.22, aimErr: 0.9, power: 0.8, shark: 0.16, pingo: 0.15, speed: 0.97, smart: 0.65, serveErr: 1, force: 0.45, feint: 0.07, quick: 0.1, read: 0.4, block: 0.2, blockErr: 0.085, dive: 0.22 },
+  dificil: { label: "Dif\xEDcil", react: 0.19, skill: 0.9, skillVar: 0.12, aimErr: 0.5, power: 0.95, shark: 0.28, pingo: 0.18, speed: 1.03, smart: 0.92, serveErr: 0.7, force: 0.55, feint: 0.09, quick: 0.12, read: 0.4, block: 0.2, blockErr: 0.065, dive: 0.2 }
 };
-var PARTNER = { label: "Parceiro", react: 0.2, skill: 0.9, skillVar: 0.1, aimErr: 0.7, power: 0.88, shark: 0.14, pingo: 0.12, speed: 1, smart: 0.8, serveErr: 0.8, force: 0.45, feint: 0.08, quick: 0.08, read: 0.5 };
+var PARTNER = { label: "Parceiro", react: 0.2, skill: 0.9, skillVar: 0.1, aimErr: 0.7, power: 0.88, shark: 0.14, pingo: 0.12, speed: 1, smart: 0.8, serveErr: 0.8, force: 0.45, feint: 0.08, quick: 0.08, read: 0.5, block: 0.3, blockErr: 0.06, dive: 0.5 };
 
 // src/net/protocol.js
-var PROTO = 2;
+var PROTO = 3;
 var HELD_BITS = { dominar: 1, levantar: 2, chapa: 4, shark: 8 };
 var PHASES = ["SERVE", "RALLY", "POINT", "MATCH_END"];
 var CHAT = ["Boa!", "Minha!", "Sua!", "De novo!"];
@@ -5099,7 +5269,9 @@ function packAction(a) {
     a.feint ? 1 : 0,
     a.tgt ? r3(a.tgt.x) : 0,
     a.tgt ? r3(a.tgt.z) : 0,
-    a.tgt ? 1 : 0
+    a.tgt ? 1 : 0,
+    a.block ? 1 : 0,
+    a.dive ? 1 : 0
   ];
 }
 function packState(m) {
