@@ -4124,6 +4124,8 @@ var Rules = class {
     const inside = isIn(x, z);
     const side = x < 0 ? 0 : 1;
     if (this.lastTeam === -1) return { winner: 1 - this.servingTeam, reason: "erro", inside };
+    const recvFail = this.rallyTouches === 2 && this.lastTeam !== this.servingTeam;
+    if (recvFail && (!inside || side === this.lastTeam)) return { winner: this.servingTeam, reason: "ace", inside };
     if (!inside) return { winner: 1 - this.lastTeam, reason: "fora", inside };
     if (side === this.lastTeam) return { winner: 1 - side, reason: this.rallyTouches === 1 ? "saque_rede" : "nao_passou", inside };
     const ace = this.rallyTouches === 1;
@@ -4589,7 +4591,7 @@ function computeTeamPlan(match, team) {
   let best = null;
   for (const c of cands) {
     const ctl2 = match.controllers[c.id];
-    const react = rules.lastTeam === team ? 0.05 : ctl2 && ctl2.diff ? ctl2.diff.react : 0.25;
+    const react = rules.lastTeam === team ? 0.05 : (ctl2 && ctl2.diff ? ctl2.diff.react : 0.25) + (rules.rallyTouches === 1 ? (ball.serveForce || 0) * 0.3 : 0);
     const it2 = interceptFor(c, ball, intent, react);
     if (!it2) continue;
     const cost = (it2.ok ? 0 : 100 - it2.slack * 10) + it2.d;
@@ -4718,8 +4720,22 @@ var AIController = class {
         if (match.time >= this.serveAt) {
           this.serveAt = 0;
           const d = this.diff, r = this.rng;
-          const target = { x: -a.side * (r.range(4.5, 8.3) + r.gauss() * d.serveErr * 0.6), z: r.range(-3.7, 3.7) + r.gauss() * d.serveErr * 0.45 };
-          match.serve(a, target, r.range(3.1, 4.3));
+          const f = r() < (d.serveForce ?? 0.3) ? 0.6 + r() * 0.4 : 0.05 + r() * 0.3;
+          const k = 0.5 + f * 0.9;
+          const rec = match.athletes.filter((o) => o.team !== a.team);
+          let best = null, bs = -1;
+          for (let i = 0; i < 10; i++) {
+            const c = { x: -a.side * r.range(f > 0.5 ? 5.5 : 4.5, 8.4), z: r.range(-3.8, 3.8) };
+            let dmin = 99;
+            for (const o of rec) dmin = Math.min(dmin, Math.hypot(o.x - c.x, o.z - c.z));
+            const sc = dmin * (d.smart ?? 0.6) + r() * (1.2 - (d.smart ?? 0.6));
+            if (sc > bs) {
+              bs = sc;
+              best = c;
+            }
+          }
+          const target = { x: best.x - a.side * r.gauss() * d.serveErr * 0.6 * k, z: best.z + r.gauss() * d.serveErr * 0.45 * k };
+          match.serve(a, target, 4.4 - f * 1.9 + r.range(-0.2, 0.2), f);
         }
       }
       return;
@@ -4941,9 +4957,11 @@ var Match = class {
     this.emit({ type: "serveSetup", team: st, server: sv });
   }
   // target: {x,z} na quadra adversaria
-  serve(a, target, apex) {
+  // force 0..1: saque forte e mais baixo e rapido (dificil de receber), mas pode ir na rede ou fora
+  serve(a, target, apex, force = 0) {
     if (this.phase !== "SERVE" || a !== this.server || a.action) return false;
     a.startServe(this, target, apex);
+    a.action.force = force;
     this.emit({ type: "swing", athlete: a, part: "saque" });
     return true;
   }
@@ -4952,9 +4970,18 @@ var Match = class {
     const act = a.action, ball = this.ball;
     const from = { x: ball.x, y: ball.y, z: ball.z };
     const to = { x: act.target.x, y: CFG.BALL_R, z: act.target.z };
-    const v = solveLob(from, to, act.apex, 0.12);
+    const f = act.force || 0;
+    const v = f > 0.45 ? solveAttack(from, to, 12 + 10 * f, 0.1 - f * 0.17) : solveLob(from, to, act.apex, 0.12 - f * 0.2);
+    if (f > 0.45) {
+      const e = this.rng.gauss() * f * 0.55;
+      v.vy += e;
+      v.vx *= 1 + this.rng.gauss() * 0.035 * f;
+      v.vz += this.rng.gauss() * 0.35 * f;
+    }
     this.rules.touch(a.id, a.team, "saque");
-    ball.launch(v, 0.5);
+    ball.launch(v, 0.5 + f * 0.3);
+    ball.rough = 0;
+    ball.serveForce = f;
     this.phase = "RALLY";
     this.phaseT = 0;
     this.emit({ type: "touch", athlete: a, part: "saque", name: MOVE_NAMES.saque, quality: 1, power: 0.5, pos: from, n: 0 });
@@ -4975,7 +5002,7 @@ var Match = class {
       q = clamp(q * (1 - 0.6 * a.tired), 0.05, 1);
       a.tired = Math.min(1, a.tired + 0.27 + 0.15 * (act.charge || 0));
     }
-    const hard = clamp((speedIn - 11) / 9, 0, 1);
+    const hard = Math.max(clamp((speedIn - 11) / 9, 0, 1), this.rules.rallyTouches === 2 ? (ball.serveForce || 0) * 0.85 : 0);
     const mate = this.mate(a);
     const aim = act.aim || {};
     const aimF = aim.x || 0, aimZ = aim.z || 0;
@@ -4983,7 +5010,10 @@ var Match = class {
     const tgt = act.tgt;
     const jit = (sigma) => r.gauss() * sigma * 0.55;
     let v, power = 0.25, name = MOVE_NAMES[part];
-    if (intent === "dominar") {
+    if (intent === "dominar" && this.rules.rallyTouches === 2 && (ball.serveForce || 0) > 0.45 && r() < hard * (1.15 - q) * 1.1) {
+      v = { vx: ball.vx * r.range(0.15, 0.55), vy: r.range(1.2, 4.2), vz: ball.vz * 0.3 + (r() < 0.5 ? -1 : 1) * r.range(2.5, 5.5) };
+      name = "ESPIRROU!";
+    } else if (intent === "dominar") {
       const noise = 0.12 + (PART_NOISE[part] ?? 0.2) + (1 - q) * 1.5 + hard * 4.5 * (1.3 - q);
       let tx = clamp(Math.abs(from.x) * 0.35 + 1.9, 2.2, 4.2) + jit(noise);
       let tz = from.z * 0.45 + mate.z * 0.15 + aimZ * 1.2 + jit(noise);
@@ -5246,9 +5276,11 @@ var PlayerController = class {
         } else if (s.charging) {
           s.charging = false;
           const t = this.serveTarget();
-          t.x += this.rng.gauss() * 0.22;
-          t.z += this.rng.gauss() * 0.22;
-          match.serve(a, t, 4.5 - s.power * 1.3);
+          const force = clamp((s.power - 0.55) / 0.4, 0, 1);
+          const noise = 0.22 + force * force * 0.55;
+          t.x += this.rng.gauss() * noise;
+          t.z += this.rng.gauss() * noise;
+          match.serve(a, t, 4.6 - force * 1.9, force);
           s.active = false;
         }
       } else s.active = false;
@@ -5286,12 +5318,12 @@ var PlayerController = class {
 
 // src/ai/Difficulty.js
 var DIFFICULTY = {
-  facil: { label: "F\xE1cil", react: 0.42, skill: 0.6, skillVar: 0.3, aimErr: 1.5, power: 0.68, shark: 0.06, pingo: 0.12, speed: 0.9, smart: 0.35, serveErr: 1.4, force: 0.3, feint: 0.03, quick: 0.04, read: 0.15, block: 0.1, blockErr: 0.12, dive: 0.1 },
-  medio: { label: "M\xE9dio", react: 0.29, skill: 0.76, skillVar: 0.22, aimErr: 0.9, power: 0.8, shark: 0.16, pingo: 0.15, speed: 0.97, smart: 0.65, serveErr: 1, force: 0.45, feint: 0.07, quick: 0.1, read: 0.4, block: 0.2, blockErr: 0.085, dive: 0.22 },
-  dificil: { label: "Dif\xEDcil", react: 0.19, skill: 0.9, skillVar: 0.12, aimErr: 0.5, power: 0.95, shark: 0.28, pingo: 0.18, speed: 1.03, smart: 0.92, serveErr: 0.7, force: 0.55, feint: 0.09, quick: 0.12, read: 0.4, block: 0.2, blockErr: 0.065, dive: 0.2 }
+  facil: { label: "F\xE1cil", react: 0.42, skill: 0.6, skillVar: 0.3, aimErr: 1.5, power: 0.68, shark: 0.06, pingo: 0.12, speed: 0.9, smart: 0.35, serveErr: 1.4, force: 0.3, feint: 0.03, quick: 0.04, read: 0.15, block: 0.1, blockErr: 0.12, dive: 0.1, serveForce: 0.1 },
+  medio: { label: "M\xE9dio", react: 0.29, skill: 0.76, skillVar: 0.22, aimErr: 0.9, power: 0.8, shark: 0.16, pingo: 0.15, speed: 0.97, smart: 0.65, serveErr: 1, force: 0.45, feint: 0.07, quick: 0.1, read: 0.4, block: 0.2, blockErr: 0.085, dive: 0.22, serveForce: 0.3 },
+  dificil: { label: "Dif\xEDcil", react: 0.19, skill: 0.9, skillVar: 0.12, aimErr: 0.5, power: 0.95, shark: 0.28, pingo: 0.18, speed: 1.03, smart: 0.92, serveErr: 0.7, force: 0.55, feint: 0.09, quick: 0.12, read: 0.4, block: 0.2, blockErr: 0.065, dive: 0.2, serveForce: 0.45 }
 };
 var STYLES = {
-  agressivo: { label: "Agressivo", mul: { shark: 1.8, pingo: 0.5, feint: 0.5, quick: 0.8, block: 0.8 }, add: { force: 0.3 } },
+  agressivo: { label: "Agressivo", mul: { shark: 1.8, pingo: 0.5, feint: 0.5, quick: 0.8, block: 0.8 }, add: { force: 0.3, serveForce: 0.25 } },
   colocador: { label: "Colocador", mul: { shark: 0.7, pingo: 1.7, feint: 1.1, aimErr: 0.55 }, add: { force: -0.15 } },
   fintador: { label: "Fintador", mul: { feint: 2.6, quick: 2.6, pingo: 1.3, shark: 0.9 }, add: { force: -0.1 } },
   muralha: { label: "Muralha", mul: { block: 1.9, read: 1.3, dive: 1.25, shark: 0.75 }, add: { force: -0.1 } }
@@ -5314,7 +5346,7 @@ function pickStyles(rng) {
   while (b === a) b = ks[Math.floor(rng() * ks.length)];
   return [a, b];
 }
-var PARTNER = { label: "Parceiro", react: 0.2, skill: 0.9, skillVar: 0.1, aimErr: 0.7, power: 0.88, shark: 0.14, pingo: 0.12, speed: 1, smart: 0.8, serveErr: 0.8, force: 0.45, feint: 0.08, quick: 0.08, read: 0.5, block: 0.3, blockErr: 0.06, dive: 0.5 };
+var PARTNER = { label: "Parceiro", react: 0.2, skill: 0.9, skillVar: 0.1, aimErr: 0.7, power: 0.88, shark: 0.14, pingo: 0.12, speed: 1, smart: 0.8, serveErr: 0.8, force: 0.45, feint: 0.08, quick: 0.08, read: 0.5, block: 0.3, blockErr: 0.06, dive: 0.5, serveForce: 0.25 };
 
 // src/net/protocol.js
 var PROTO = 3;
