@@ -5880,6 +5880,7 @@ var server = import_node_http.default.createServer((req, res) => {
   const body = load(file);
   const ae = req.headers["accept-encoding"] || "";
   const headers = { "Content-Type": TYPES[import_node_path.default.extname(file)] || "application/octet-stream", "Cache-Control": file.endsWith(".html") ? "no-cache" : "public, max-age=86400", Vary: "Accept-Encoding" };
+  if (file.endsWith(".glb")) headers["Access-Control-Allow-Origin"] = "*";
   let data = body.raw;
   if (/\bbr\b/.test(ae)) {
     headers["Content-Encoding"] = "br";
