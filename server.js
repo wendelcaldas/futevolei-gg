@@ -4180,6 +4180,14 @@ var CONTACT_OFFSET = {
   cabecada: 0.2,
   saque: 0.5
 };
+var ATTACK_INTENTS = /* @__PURE__ */ new Set(["chapa", "shark"]);
+function aimTarget(side, aim, intent, fromZ = 0) {
+  const f = clamp(aim.x || 0, -1, 1), l = clamp(aim.z || 0, -1, 1);
+  if (intent === "pingo") return { x: -side * (1.25 + Math.max(0, f) * 1.1), z: clamp(fromZ * 0.4 + l * 3.4, -3.9, 3.9) };
+  if (intent === "levantar") return null;
+  const tx = f >= 0 ? 6 + f * 2.1 : 6 + f * 3.2;
+  return { x: -side * tx, z: l * 3.7 };
+}
 function pickPart(intent, h) {
   if (intent === "shark") return "shark";
   if (intent === "chapa") return h >= 3.5 ? "cabecada" : h >= 1.15 ? "chapa" : "chute";
@@ -4307,10 +4315,40 @@ var Athlete = class {
       label,
       aim: opts.aim || null,
       powerMul: opts.powerMul ?? 1,
-      dur: c.t + (RECOVERY[part] ?? 0.35)
+      dur: c.t + (RECOVERY[part] ?? 0.35),
+      charge: opts.charge ?? 0,
+      feint: false,
+      tgt: null
     };
+    this.retarget(c.z);
     this.lastLabel = label;
     match.emit({ type: "swing", athlete: this, part, label });
+    return true;
+  }
+  // atualiza o alvo do golpe armado (o humano pode mudar a mira ate o contato)
+  retarget(fromZ = this.z) {
+    const a = this.action;
+    if (!a || a.whiff) return;
+    const aim = a.aim || {};
+    if (a.feint) a.tgt = aimTarget(this.side, aim, "pingo", fromZ);
+    else if (aim.target) a.tgt = { x: aim.target.x, z: aim.target.z };
+    else if (ATTACK_INTENTS.has(a.intent) || a.intent === "pingo") a.tgt = aimTarget(this.side, aim, a.intent, fromZ);
+    else a.tgt = null;
+  }
+  // finta: durante a armacao de chapa/shark troca o golpe por uma deixadinha logo apos a rede
+  feint(match) {
+    const a = this.action;
+    if (!a || a.done || a.whiff || a.feint || !ATTACK_INTENTS.has(a.intent)) return false;
+    const left = a.contactTick - a.tick;
+    if (left < 3) return false;
+    a.feint = true;
+    a.intent = "pingo";
+    if (a.part === "shark" || a.part === "chapa") a.part = "pingo";
+    a.quality = clamp(a.quality * (left < 6 ? 0.78 : 0.92), 0.05, 1);
+    a.charge = 0;
+    if (a.aim && a.aim.target) a.aim = { x: 0, z: 0 };
+    this.retarget(this.z);
+    match.emit({ type: "feint", athlete: this });
     return true;
   }
   startServe(match, target, apex) {
@@ -4516,6 +4554,8 @@ function computeTeamPlan(match, team) {
     intent = ch.intent;
     plan.aim = ch.aim;
     plan.quality = ch.quality;
+    plan.charge = ch.charge || 0;
+    plan.feint = !!ch.feint;
     if (intent !== (n === 1 ? "dominar" : n === 2 ? "levantar" : "chapa")) {
       const it2 = interceptFor(taker, ball, intent, best.react);
       if (it2 && it2.ok) best.it = it2;
@@ -4553,7 +4593,7 @@ var AIController = class {
     const d = this.diff, r = this.rng, a = this.a;
     const quality = this.rollQuality();
     if (n === 1) return { intent: "dominar", aim: null, quality };
-    if (n === 2) return { intent: "levantar", aim: null, quality };
+    if (n === 2) return { intent: "levantar", aim: null, quality, charge: r() < (d.quick || 0) && quality > 0.6 ? 1 : 0 };
     const opp = match.athletes.filter((p) => p.team !== a.team);
     let intent = "chapa";
     const roll = r();
@@ -4561,6 +4601,8 @@ var AIController = class {
     if (roll < d.shark && peakOk) intent = "shark";
     else if (roll < d.shark + d.pingo) intent = "pingo";
     let target = null;
+    const charge = intent === "pingo" ? 0 : r() < (d.force ?? 0.4) ? 0.6 + r() * 0.4 : r() * 0.12;
+    const prec = 0.45 + 0.75 * charge;
     if (intent !== "pingo") {
       let bestScore = -1;
       for (let k = 0; k < 14; k++) {
@@ -4573,12 +4615,13 @@ var AIController = class {
           target = { x: tx, z: tz };
         }
       }
-      target.x += r.gauss() * d.aimErr * 0.6;
-      target.z += r.gauss() * d.aimErr * 0.6;
+      target.x += r.gauss() * d.aimErr * 0.6 * prec;
+      target.z += r.gauss() * d.aimErr * 0.6 * prec;
     } else {
       target = { x: -a.side * r.range(1.2, 2.4), z: clamp((it ? it.z : 0) + r.range(-2.5, 2.5), -3.8, 3.8) };
     }
-    return { intent, aim: { target }, quality };
+    const feint = intent !== "pingo" && r() < (d.feint || 0);
+    return { intent, aim: { target }, quality, charge, feint };
   }
   update(dt, match) {
     const a = this.a, inp = a.input;
@@ -4586,6 +4629,14 @@ var AIController = class {
     inp.z = 0;
     inp.sprint = false;
     inp.jump = false;
+    const act = a.action;
+    if (act && this.feintAid === act.aid && !act.done) {
+      const left = act.contactTick - act.tick;
+      if (left <= 8 + (this.rng() * 3 | 0)) {
+        a.feint(match);
+        this.feintAid = null;
+      }
+    }
     if (match.phase === "SERVE") {
       if (match.server === a && !a.action) {
         if (!this.serveAt) this.serveAt = match.time + CFG.SERVE_DELAY + this.rng() * 0.6;
@@ -4611,7 +4662,8 @@ var AIController = class {
           const urgent = ball.remaining() * CFG.DT < 0.2;
           const due = match.time >= plan.point.t - 0.24;
           if (due && c.t <= 0.17 || urgent) {
-            a.tryHit(match, plan.intent, { window: 0.2, pull: 0.3, quality: plan.quality, aim: plan.aim, powerMul: this.diff.power });
+            a.tryHit(match, plan.intent, { window: 0.2, pull: 0.3, quality: plan.quality, aim: plan.aim, powerMul: this.diff.power, charge: plan.charge || 0 });
+            this.feintAid = plan.feint && a.action ? a.action.aid : null;
           }
         }
       }
@@ -4624,6 +4676,20 @@ var AIController = class {
     }
     const hx = a.side * 5.3;
     let hz = (a.idx ? 2.2 : -2.2) + clamp(ball.z, -4, 4) * 0.22;
+    const atk = match.athletes.find((o) => o.team !== a.team && o.action && !o.action.done && !o.action.whiff && o.action.tgt && (o.action.intent === "chapa" || o.action.intent === "shark"));
+    if (atk) {
+      const at = atk.action;
+      if (this.readAid !== at.aid) {
+        this.readAid = at.aid;
+        this.reads = this.rng() < (this.diff.read ?? 0.4);
+      }
+      const mate = match.mate(a);
+      const mine = Math.hypot(at.tgt.x - a.x, at.tgt.z - a.z) <= Math.hypot(at.tgt.x - mate.x, at.tgt.z - mate.z);
+      if (this.reads && mine) {
+        this.moveTo(clamp(at.tgt.x * a.side, 3.2, 8) * a.side, at.tgt.z, true);
+        return;
+      }
+    }
     this.moveTo(hx, hz, false);
   }
   moveTo(x, z, sprint) {
@@ -4652,7 +4718,9 @@ var MOVE_NAMES = {
   cabecada: "CABE\xC7ADA!",
   saque: "SAQUE",
   levantar: "LEVANTADA",
-  devolver: "DEVOLU\xC7\xC3O"
+  devolver: "DEVOLU\xC7\xC3O",
+  finta: "FINTA!",
+  rapida: "LEVANTADA R\xC1PIDA"
 };
 var Match = class {
   constructor(opts = {}) {
@@ -4744,6 +4812,8 @@ var Match = class {
     const mate = this.mate(a);
     const aim = act.aim || {};
     const aimF = aim.x || 0, aimZ = aim.z || 0;
+    const charge = act.charge > 0.15 ? clamp((act.charge - 0.15) / 0.85, 0, 1) : 0;
+    const tgt = act.tgt;
     const jit = (sigma) => r.gauss() * sigma * 0.55;
     let v, power = 0.25, name = MOVE_NAMES[part];
     if (intent === "dominar") {
@@ -4754,12 +4824,13 @@ var Match = class {
       const apex = Math.max(from.y + 1.6, 3.7 + jit(noise) * 0.4);
       v = solveApex(from, { x: s * tx, y: 1.25, z: tz }, apex);
     } else if (intent === "levantar") {
-      const noise = 0.08 + (PART_NOISE[part] ?? 0.2) * 0.6 + (1 - q) * 1.25 + hard * 0.5;
-      const tx = Math.max(0.55, 1.25 - aimF * 0.3 + jit(noise) * 0.7);
+      const quick = charge > 0.5;
+      const noise = (0.08 + (PART_NOISE[part] ?? 0.2) * 0.6 + (1 - q) * 1.25 + hard * 0.5) * (quick ? 1.3 : 1);
+      const tx = Math.max(0.55, (quick ? 0.95 : 1.25) - aimF * 0.3 + jit(noise) * 0.7);
       const tz = clamp(lerp(from.z, mate.z, 0.55) + aimZ * 1.6 + jit(noise), -3.6, 3.6);
-      const apex = Math.max(from.y + 1.8, 4.7 + jit(noise) * 0.5);
+      const apex = quick ? Math.max(from.y + 0.9, 3.45 + jit(noise) * 0.3) : Math.max(from.y + 1.8, 4.7 + jit(noise) * 0.5);
       v = solveApex(from, { x: s * tx, y: 2.75, z: tz }, apex);
-      name = MOVE_NAMES.levantar;
+      name = quick ? MOVE_NAMES.rapida : MOVE_NAMES.levantar;
       power = 0.3;
     } else if (intent === "devolver") {
       const noise = 0.5 + (1 - q) * 1.4;
@@ -4770,7 +4841,10 @@ var Match = class {
     } else if (intent === "pingo") {
       const noise = 0.2 + (1 - q) * 1;
       let tx, tz;
-      if (aim.target) {
+      if (tgt) {
+        tx = Math.abs(tgt.x);
+        tz = tgt.z;
+      } else if (aim.target) {
         tx = Math.abs(aim.target.x);
         tz = aim.target.z;
       } else {
@@ -4779,9 +4853,9 @@ var Match = class {
       }
       tx = Math.max(0.5, tx + jit(noise));
       tz += jit(noise);
-      const apex = Math.max(from.y + 0.12, CFG.NET_H + 0.5) + Math.abs(from.x) * 0.12;
-      v = solveLob(from, { x: -s * tx, y: CFG.BALL_R, z: tz }, apex, 0.1 + q * 0.08);
-      name = MOVE_NAMES.pingo;
+      const apex = Math.max(from.y + 0.06, CFG.NET_H + (act.feint ? 0.24 : 0.34)) + Math.abs(from.x) * 0.1;
+      v = solveLob(from, { x: -s * tx, y: CFG.BALL_R, z: tz }, apex, 0.05 + q * 0.06);
+      name = act.feint ? MOVE_NAMES.finta : MOVE_NAMES.pingo;
       power = 0.3;
     } else {
       let speed, noise, margin = 0.07;
@@ -4804,8 +4878,14 @@ var Match = class {
         power = 0.45;
       }
       speed *= act.powerMul * clamp(1.18 - Math.abs(from.x) / 9 * 0.7, 0.55, 1);
+      speed *= 0.93 + 0.24 * charge;
+      noise *= 0.55 + 1 * charge;
+      margin -= 0.16 * charge * (1 - q);
       let tx, tz;
-      if (aim.target) {
+      if (tgt) {
+        tx = Math.abs(tgt.x);
+        tz = tgt.z;
+      } else if (aim.target) {
         tx = Math.abs(aim.target.x);
         tz = aim.target.z;
       } else {
@@ -4817,7 +4897,7 @@ var Match = class {
       v = solveAttack(from, { x: -s * tx, y: CFG.BALL_R, z: tz }, speed, margin);
     }
     ball.launch(v, power);
-    this.emit({ type: "touch", athlete: a, part, intent, name, quality: q, label: act.label, power, pos: from, n, speedIn });
+    this.emit({ type: "touch", athlete: a, part, intent, name, quality: q, label: act.label, power, pos: from, n, speedIn, feint: !!act.feint, charge });
     if (fault) this.endPoint(1 - a.team, fault);
   }
   endPoint(winner, reason) {
@@ -4959,6 +5039,16 @@ var PlayerController = class {
     inp.sprint = I.sprint;
     inp.jump = I.consume("jump");
     if (match.phase !== "RALLY") return;
+    const act = a.action;
+    if (act && !act.done && !act.whiff) {
+      act.aim = { x: I.mx * -a.side, z: I.mz };
+      a.retarget(match.ball.z);
+      const key = act.feint ? null : act.intent;
+      if (key && I.held[key] && (key === "chapa" || key === "shark" || key === "levantar")) act.charge = Math.min(1, (act.charge || 0) + dt / 0.42);
+      if (I.consume("pingo")) a.feint(match);
+      I.clearPressed();
+      return;
+    }
     const R = match.rules;
     const wouldDouble = R.lastTeam === a.team && R.lastToucher === a.id;
     for (const intent of ["shark", "chapa", "pingo", "levantar", "dominar"]) {
@@ -4973,14 +5063,15 @@ var PlayerController = class {
 
 // src/ai/Difficulty.js
 var DIFFICULTY = {
-  facil: { label: "F\xE1cil", react: 0.42, skill: 0.6, skillVar: 0.3, aimErr: 1.5, power: 0.68, shark: 0.06, pingo: 0.12, speed: 0.9, smart: 0.35, serveErr: 1.4 },
-  medio: { label: "M\xE9dio", react: 0.29, skill: 0.76, skillVar: 0.22, aimErr: 0.9, power: 0.8, shark: 0.16, pingo: 0.15, speed: 0.97, smart: 0.65, serveErr: 1 },
-  dificil: { label: "Dif\xEDcil", react: 0.19, skill: 0.9, skillVar: 0.12, aimErr: 0.5, power: 0.95, shark: 0.28, pingo: 0.18, speed: 1.03, smart: 0.92, serveErr: 0.7 }
+  facil: { label: "F\xE1cil", react: 0.42, skill: 0.6, skillVar: 0.3, aimErr: 1.5, power: 0.68, shark: 0.06, pingo: 0.12, speed: 0.9, smart: 0.35, serveErr: 1.4, force: 0.3, feint: 0.03, quick: 0.04, read: 0.15 },
+  medio: { label: "M\xE9dio", react: 0.29, skill: 0.76, skillVar: 0.22, aimErr: 0.9, power: 0.8, shark: 0.16, pingo: 0.15, speed: 0.97, smart: 0.65, serveErr: 1, force: 0.45, feint: 0.09, quick: 0.1, read: 0.45 },
+  dificil: { label: "Dif\xEDcil", react: 0.19, skill: 0.9, skillVar: 0.12, aimErr: 0.5, power: 0.95, shark: 0.28, pingo: 0.18, speed: 1.03, smart: 0.92, serveErr: 0.7, force: 0.55, feint: 0.15, quick: 0.16, read: 0.7 }
 };
-var PARTNER = { label: "Parceiro", react: 0.2, skill: 0.9, skillVar: 0.1, aimErr: 0.7, power: 0.88, shark: 0.14, pingo: 0.12, speed: 1, smart: 0.8, serveErr: 0.8 };
+var PARTNER = { label: "Parceiro", react: 0.2, skill: 0.9, skillVar: 0.1, aimErr: 0.7, power: 0.88, shark: 0.14, pingo: 0.12, speed: 1, smart: 0.8, serveErr: 0.8, force: 0.45, feint: 0.08, quick: 0.08, read: 0.5 };
 
 // src/net/protocol.js
-var PROTO = 1;
+var PROTO = 2;
+var HELD_BITS = { dominar: 1, levantar: 2, chapa: 4, shark: 8 };
 var PHASES = ["SERVE", "RALLY", "POINT", "MATCH_END"];
 var CHAT = ["Boa!", "Minha!", "Sua!", "De novo!"];
 var r3 = (v) => Math.round(v * 1e3) / 1e3;
@@ -5003,7 +5094,12 @@ function packAction(a) {
     r3(a.quality || 0),
     a.label || 0,
     r3(a.dur),
-    a.serve ? 1 : 0
+    a.serve ? 1 : 0,
+    r3(a.charge || 0),
+    a.feint ? 1 : 0,
+    a.tgt ? r3(a.tgt.x) : 0,
+    a.tgt ? r3(a.tgt.z) : 0,
+    a.tgt ? 1 : 0
   ];
 }
 function packState(m) {
@@ -5339,7 +5435,8 @@ var Hub = class {
         s.mx = num(d.x, -1, 1);
         s.mz = num(d.z, -1, 1);
         s.sprint = !!d.s;
-        s.held.dominar = !!d.h;
+        const hm = d.h | 0;
+        for (const k in HELD_BITS) s.held[k] = !!(hm & HELD_BITS[k]);
         if (Array.isArray(d.p)) {
           for (const a of d.p.slice(0, 6)) if (ACTIONS.includes(a)) s.pressed[a] = true;
         }
